@@ -3,13 +3,7 @@ package org.openstreetmap.josm.gui.tagging.presets;
 
 import static org.openstreetmap.josm.tools.I18n.tr;
 
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 
 import javax.swing.JMenu;
 import javax.swing.JMenuItem;
@@ -40,7 +34,7 @@ import org.openstreetmap.josm.tools.SubclassFilteredCollection;
 public final class TaggingPresets {
 
     /** The collection of tagging presets */
-    private static final Collection<TaggingPreset> taggingPresets = new ArrayList<>();
+    private static final List<TaggingPreset> taggingPresets = new ArrayList<>();
 
     /** cache for key/value pairs found in the preset */
     private static final MultiMap<String, String> PRESET_TAG_CACHE = new MultiMap<>();
@@ -186,8 +180,8 @@ public final class TaggingPresets {
      * Replies a new collection containing all tagging presets.
      * @return a new collection containing all tagging presets. Empty if presets are not initialized (never null)
      */
-    public static Collection<TaggingPreset> getTaggingPresets() {
-        return Collections.unmodifiableCollection(taggingPresets);
+    public static List<TaggingPreset> getTaggingPresets() {
+        return taggingPresets;
     }
 
     /**

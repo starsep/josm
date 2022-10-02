@@ -1,12 +1,14 @@
-// License: GPL. For details, see LICENSE file.
+
 package org.openstreetmap.josm.gui.tagging.presets;
 
+import static org.openstreetmap.josm.gui.tagging.presets.TaggingPresetSelector.PresetClassification.simplifyString;
 import static org.openstreetmap.josm.tools.I18n.tr;
 
 import java.awt.BorderLayout;
 import java.awt.Component;
 import java.awt.Dimension;
 import java.awt.event.ActionEvent;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -17,6 +19,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 import javax.swing.AbstractAction;
@@ -33,10 +36,18 @@ import javax.swing.ListCellRenderer;
 import javax.swing.event.ListSelectionEvent;
 import javax.swing.event.ListSelectionListener;
 
-import org.openstreetmap.josm.data.osm.DataSelectionListener;
-import org.openstreetmap.josm.data.osm.DataSet;
-import org.openstreetmap.josm.data.osm.OsmDataManager;
-import org.openstreetmap.josm.data.osm.OsmPrimitive;
+import com.drew.metadata.Directory;
+import org.apache.lucene.analysis.standard.StandardAnalyzer;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.document.IntPoint;
+import org.apache.lucene.document.TextField;
+import org.apache.lucene.index.*;
+import org.apache.lucene.queryparser.classic.ParseException;
+import org.apache.lucene.queryparser.classic.QueryParser;
+import org.apache.lucene.search.*;
+import org.apache.lucene.store.ByteBuffersDirectory;
+import org.openstreetmap.josm.data.osm.*;
 import org.openstreetmap.josm.data.preferences.BooleanProperty;
 import org.openstreetmap.josm.gui.MainApplication;
 import org.openstreetmap.josm.gui.tagging.presets.items.ComboMultiSelect;
@@ -134,7 +145,7 @@ public class TaggingPresetSelector extends SearchTextResultListPanel<TaggingPres
             }
         }
 
-        private static String simplifyString(String s) {
+        static String simplifyString(String s) {
             return Utils.deAccent(s).toLowerCase(Locale.ENGLISH).replaceAll("\\p{Punct}", "");
         }
 
@@ -254,8 +265,13 @@ public class TaggingPresetSelector extends SearchTextResultListPanel<TaggingPres
 
         DataSet ds = OsmDataManager.getInstance().getEditDataSet();
         Collection<OsmPrimitive> selected = (ds == null) ? Collections.<OsmPrimitive>emptyList() : ds.getSelected();
+
+        long before = System.currentTimeMillis();
         final List<PresetClassification> result = classifications.getMatchingPresets(
                 text, onlyApplicable, inTags, getTypesInSelection(), selected);
+
+        long after = System.currentTimeMillis();
+        System.out.printf("Filtering took %d ms%n", after - before);
 
         final TaggingPreset oldPreset = getSelectedPreset();
         lsResultModel.setItems(Utils.transform(result, x -> x.preset));
@@ -273,6 +289,8 @@ public class TaggingPresetSelector extends SearchTextResultListPanel<TaggingPres
      * A collection of {@link PresetClassification}s with the functionality of filtering wrt. searchString.
      */
     public static class PresetClassifications implements Iterable<PresetClassification> {
+        private final ByteBuffersDirectory memoryIndex = new ByteBuffersDirectory();
+        private final StandardAnalyzer analyzer = new StandardAnalyzer();
 
         private final List<PresetClassification> classifications = new ArrayList<>();
 
@@ -295,8 +313,94 @@ public class TaggingPresetSelector extends SearchTextResultListPanel<TaggingPres
         public List<PresetClassification> getMatchingPresets(String[] groupWords, String[] nameWords, boolean onlyApplicable,
                 boolean inTags, Set<TaggingPresetType> presetTypes, final Collection<? extends OsmPrimitive> selectedPrimitives) {
 
-            final List<PresetClassification> result = new ArrayList<>();
-            for (PresetClassification presetClassification : classifications) {
+            final Set<PresetClassification> result = new HashSet<>();
+            long before = System.currentTimeMillis();
+
+            if (nameWords.length == 1 && nameWords[0].length() == 0) {
+                // TODO: filter applicable
+                System.out.println("EMPTY QUERY");
+                return new ArrayList<>(classifications);
+            }
+            // TODO: favorites
+            try {
+                IndexReader indexReader = DirectoryReader.open(memoryIndex);
+                IndexSearcher searcher = new IndexSearcher(indexReader);
+
+                for (String nameWord : nameWords) {
+                    Query prefixQuery = new PrefixQuery(new Term("names", simplifyString(nameWord)));
+                    for (ScoreDoc scoreDoc : searcher.search(prefixQuery, Integer.MAX_VALUE).scoreDocs) {
+                        final PresetClassification presetClassification = classifications.get(scoreDoc.doc);
+                        if (result.contains(presetClassification)) continue;
+                        presetClassification.classification = CLASSIFICATION_NAME_MATCH + 2;
+                        result.add(presetClassification);
+                    }
+                    Query wildcardQuery = new WildcardQuery(new Term("names", "*" + simplifyString(nameWord) + "*"));
+                    for (ScoreDoc scoreDoc : searcher.search(wildcardQuery, Integer.MAX_VALUE).scoreDocs) {
+                        final PresetClassification presetClassification = classifications.get(scoreDoc.doc);
+                        if (result.contains(presetClassification)) continue;
+                        presetClassification.classification = CLASSIFICATION_NAME_MATCH + 1;
+                        result.add(presetClassification);
+                    }
+                }
+                for (String nameWord : nameWords) {
+                    Query prefixQuery = new PrefixQuery(new Term("names", simplifyString(nameWord)));
+                    for (ScoreDoc scoreDoc : searcher.search(prefixQuery, Integer.MAX_VALUE).scoreDocs) {
+                        final PresetClassification presetClassification = classifications.get(scoreDoc.doc);
+                        if (result.contains(presetClassification)) continue;
+                        presetClassification.classification = CLASSIFICATION_NAME_MATCH + 2;
+                        result.add(presetClassification);
+                    }
+                    Query wildcardQuery = new WildcardQuery(new Term("names", "*" + simplifyString(nameWord) + "*"));
+                    for (ScoreDoc scoreDoc : searcher.search(wildcardQuery, Integer.MAX_VALUE).scoreDocs) {
+                        final PresetClassification presetClassification = classifications.get(scoreDoc.doc);
+                        if (result.contains(presetClassification)) continue;
+                        presetClassification.classification = CLASSIFICATION_NAME_MATCH + 1;
+                        result.add(presetClassification);
+                    }
+                }
+                if (groupWords != null) {
+                    for (String groupWord : groupWords) {
+                        Query prefixQuery = new PrefixQuery(new Term("groups", simplifyString(groupWord)));
+                        for (ScoreDoc scoreDoc : searcher.search(prefixQuery, Integer.MAX_VALUE).scoreDocs) {
+                            final PresetClassification presetClassification = classifications.get(scoreDoc.doc);
+                            if (result.contains(presetClassification)) continue;
+                            presetClassification.classification = CLASSIFICATION_GROUP_MATCH + 2;
+                            result.add(presetClassification);
+                        }
+                        Query wildcardQuery = new WildcardQuery(new Term("groups", "*" + simplifyString(groupWord) + "*"));
+                        for (ScoreDoc scoreDoc : searcher.search(wildcardQuery, Integer.MAX_VALUE).scoreDocs) {
+                            final PresetClassification presetClassification = classifications.get(scoreDoc.doc);
+                            if (result.contains(presetClassification)) continue;
+                            presetClassification.classification = CLASSIFICATION_GROUP_MATCH + 1;
+                            result.add(presetClassification);
+                        }
+                    }
+                }
+                if (inTags) {
+                    for (String nameWord: nameWords) {
+                        Query prefixQuery = new PrefixQuery(new Term("tags", simplifyString(nameWord)));
+                        for (ScoreDoc scoreDoc : searcher.search(prefixQuery, Integer.MAX_VALUE).scoreDocs) {
+                            final PresetClassification presetClassification = classifications.get(scoreDoc.doc);
+                            if (result.contains(presetClassification)) continue;
+                            presetClassification.classification = CLASSIFICATION_TAGS_MATCH + 2;
+                            result.add(presetClassification);
+                        }
+                        Query wildcardQuery = new WildcardQuery(new Term("tags", "*" + simplifyString(nameWord) + "*"));
+                        for (ScoreDoc scoreDoc : searcher.search(wildcardQuery, Integer.MAX_VALUE).scoreDocs) {
+                            final PresetClassification presetClassification = classifications.get(scoreDoc.doc);
+                            if (result.contains(presetClassification)) continue;
+                            presetClassification.classification = CLASSIFICATION_TAGS_MATCH + 1;
+                            result.add(presetClassification);
+                        }
+                    }
+                }
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+
+            long after = System.currentTimeMillis();
+            System.out.printf("Query FTS took %d ms\n", after - before);
+            /*for (PresetClassification presetClassification : classifications) {
                 TaggingPreset preset = presetClassification.preset;
                 presetClassification.classification = 0;
 
@@ -341,10 +445,21 @@ public class TaggingPresetSelector extends SearchTextResultListPanel<TaggingPres
                     presetClassification.classification += presetClassification.favoriteIndex;
                     result.add(presetClassification);
                 }
-            }
+            }*/
 
-            Collections.sort(result);
-            return result;
+            final List<PresetClassification> listResult = new ArrayList<>(result.stream().filter(presetClassification -> {
+                TaggingPreset preset = presetClassification.preset;
+                boolean suitable = preset.typeMatches(presetTypes);
+
+                if (!suitable && preset.types.contains(TaggingPresetType.RELATION)
+                        && preset.roles != null && !preset.roles.roles.isEmpty()) {
+                    suitable = preset.roles.roles.stream().anyMatch(
+                            object -> object.memberExpression != null && selectedPrimitives.stream().anyMatch(object.memberExpression));
+                }
+                return suitable;
+            }).collect(Collectors.toList()));
+            Collections.sort(listResult);
+            return listResult;
         }
 
         /**
@@ -358,12 +473,27 @@ public class TaggingPresetSelector extends SearchTextResultListPanel<TaggingPres
          * Loads a given collection of presets.
          * @param presets presets collection
          */
-        public void loadPresets(Collection<TaggingPreset> presets) {
-            for (TaggingPreset preset : presets) {
+        public void loadPresets(List<TaggingPreset> presets) {
+            for (TaggingPreset preset: presets) {
                 if (preset instanceof TaggingPresetSeparator || preset instanceof TaggingPresetMenu) {
                     continue;
                 }
-                classifications.add(new PresetClassification(preset));
+                final PresetClassification presetClassification = new PresetClassification(preset);
+                classifications.add(presetClassification);
+            }
+            Collections.sort(classifications);
+            final IndexWriterConfig indexWriterConfig = new IndexWriterConfig(analyzer);
+            try {
+                IndexWriter writer = new IndexWriter(memoryIndex, indexWriterConfig);
+                for (PresetClassification presetClassification: classifications) {
+                    Document document = new Document();
+                    document.add(new TextField("names", simplifyString(String.join(" ", presetClassification.names)), Field.Store.YES));
+                    document.add(new TextField("tags", simplifyString(String.join(" ", presetClassification.tags)), Field.Store.YES));
+                    document.add(new TextField("groups", simplifyString(String.join(" ", presetClassification.groups)), Field.Store.YES));
+                    writer.addDocument(document);
+                }
+                writer.close();
+            } catch (IOException e) {
             }
         }
 
@@ -405,7 +535,7 @@ public class TaggingPresetSelector extends SearchTextResultListPanel<TaggingPres
      * Initializes the selector with a given collection of presets.
      * @param presets presets collection
      */
-    public void init(Collection<TaggingPreset> presets) {
+    public void init(List<TaggingPreset> presets) {
         classifications.clear();
         classifications.loadPresets(presets);
         init();
